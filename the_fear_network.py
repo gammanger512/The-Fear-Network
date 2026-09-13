@@ -66,7 +66,7 @@ FPS = 30
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 GROK_API_KEY = os.getenv("GROK_API_KEY", "").strip()
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.6").strip()
 
 # Media APIs
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
@@ -136,8 +136,14 @@ def safe_filename(value: str, fallback: str = "video") -> str:
     return value[:80] or fallback
 
 
-def http_json(method: str, url: str, *, headers: dict[str, str] | None = None,
-              params: dict[str, Any] | None = None, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+def http_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     response = requests.request(
         method,
         url,
@@ -146,8 +152,24 @@ def http_json(method: str, url: str, *, headers: dict[str, str] | None = None,
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-    return response.json()
+
+    if response.status_code >= 400:
+        body = response.text.strip()
+        raise RuntimeError(
+            f"HTTP {response.status_code} for {method} {url}: "
+            f"{body[:2000] or '<empty response>'}"
+        )
+
+    if not response.text.strip():
+        raise RuntimeError(f"Empty response from {method} {url}.")
+
+    try:
+        return response.json()
+    except ValueError as error:
+        raise RuntimeError(
+            f"Invalid JSON response from {method} {url}: "
+            f"{response.text[:2000]}"
+        ) from error
 
 
 def download_file(url: str, destination: Path) -> Path:
@@ -167,21 +189,36 @@ def download_file(url: str, destination: Path) -> Path:
 
 
 def extract_json(text: str) -> dict[str, Any]:
-    text = text.strip()
+    text = str(text or "").strip()
+
     if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?", "", text, flags=re.I).strip()
-        text = re.sub(r"```$", "", text).strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I).strip()
+        text = re.sub(r"\s*```$", "", text).strip()
+
     try:
-        return json.loads(text)
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+        pass
+
+    # Handle occasional prose before/after a JSON object.
+    match = re.search(r"\{.*\}", text, flags=re.S)
+    if not match:
+        raise ValueError(f"No JSON object found in AI response: {text[:2000]}")
+
+    value = json.loads(match.group(0))
+    if not isinstance(value, dict):
+        raise ValueError("AI JSON response was not an object.")
+    return value
 
 
-def call_openrouter(messages: list[dict[str, str]], *, temperature: float = 0.8,
-                    max_tokens: int = 12000) -> str:
+def call_openrouter(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.8,
+    max_tokens: int = 12000,
+) -> str:
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not set.")
 
@@ -191,15 +228,45 @@ def call_openrouter(messages: list[dict[str, str]], *, temperature: float = 0.8,
         "HTTP-Referer": "https://github.com/",
         "X-Title": "The Fear Network",
     }
+
+    # Do NOT force response_format here. openrouter/free routes across
+    # a changing pool of free models; asking for plain JSON in the prompt
+    # and parsing it locally is more portable.
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "response_format": {"type": "json_object"},
     }
-    data = http_json("POST", "https://openrouter.ai/api/v1/chat/completions", headers=headers, payload=payload)
-    return str(data["choices"][0]["message"]["content"])
+
+    data = http_json(
+        "POST",
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        payload=payload,
+    )
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter returned no choices: {data}")
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+
+    # Some reasoning-capable models may return content as a structured list.
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text", "")))
+            elif isinstance(item, str):
+                parts.append(item)
+        content = "".join(parts)
+
+    if not content:
+        raise RuntimeError(f"OpenRouter returned empty content: {data}")
+
+    return str(content)
 
 
 def call_grok(messages: list[dict[str, str]], *, temperature: float = 0.8,
@@ -241,7 +308,9 @@ def ai_json(system_prompt: str, user_prompt: str, *, temperature: float = 0.8,
     for provider_name, provider in providers:
         try:
             log(f"🤖 AI provider: {provider_name}")
-            return extract_json(provider(messages, temperature=temperature, max_tokens=max_tokens))
+            result = provider(messages, temperature=temperature, max_tokens=max_tokens)
+            log(f"✅ {provider_name} returned {len(result)} characters")
+            return extract_json(result)
         except Exception as error:
             last_error = error
             log(f"⚠️ {provider_name} failed: {type(error).__name__}: {error}")
@@ -273,7 +342,7 @@ Return JSON only:
 """
     try:
         data = ai_json(
-            "You are an expert horror story concept writer for a faceless YouTube channel.",
+            "You are an expert horror story concept writer for a faceless YouTube channel. Follow the requested JSON schema exactly and return no commentary outside JSON.",
             prompt,
             temperature=0.9,
             max_tokens=800,
@@ -328,7 +397,7 @@ Return JSON only in this shape:
 """
 
     data = ai_json(
-        "You are the head writer and visual director of The Fear Network. Produce production-ready horror stories.",
+        "You are the head writer and visual director of The Fear Network. Produce production-ready horror stories and return only the requested JSON object.",
         prompt,
         temperature=0.85,
         max_tokens=22000,
