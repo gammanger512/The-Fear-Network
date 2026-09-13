@@ -43,6 +43,8 @@ MEDIA_DIR = WORK_DIR / "media"
 AUDIO_DIR = WORK_DIR / "audio"
 MUSIC_DIR = BASE_DIR / "music"
 VOICE_WAV = BASE_DIR / "voice.wav"
+IDEA_MEMORY_DIR = BASE_DIR / "data"
+USED_IDEAS_FILE = IDEA_MEMORY_DIR / "used_ideas.txt"
 
 for folder in (OUTPUT_DIR, WORK_DIR, MEDIA_DIR, AUDIO_DIR, MUSIC_DIR):
     folder.mkdir(parents=True, exist_ok=True)
@@ -309,30 +311,286 @@ def fallback_idea() -> str:
     return random.choice(ideas)
 
 
-def generate_idea() -> str:
-    prompt = f"""
-Create one original horror-video concept for The Fear Network.
-Audience: English-speaking viewers, especially the United States.
-Style: cinematic, disturbing, suspenseful, plausible, psychologically gripping.
-Avoid copying known films, Reddit posts, creepypastas, or famous stories.
-Do not use excessive gore. Build a strong hook and escalating mystery.
-Topic hint from the user: {TOPIC_HINT or 'none'}
-Return JSON only:
-{{"idea": "one-sentence concept"}}
-"""
-    try:
-        data = ai_json(
-            "You are an expert horror story concept writer for a faceless YouTube channel.",
-            prompt,
-            temperature=0.9,
-            max_tokens=800,
-        )
-        idea = str(data.get("idea", "")).strip()
+
+# ============================================================
+# IDEA MEMORY — LOCAL CHECK, PERSISTENT FILE
+# ============================================================
+# The file data/used_ideas.txt is NEVER sent to OpenRouter/Groq.
+# The AI only receives a small request for ONE new idea.
+#
+# Workflow:
+#   AI -> one candidate
+#   Python -> local duplicate check
+#   duplicate -> AI asks for a different candidate
+#   unique -> story production continues
+#
+# The winning idea is saved only after the YouTube upload succeeds.
+# The GitHub Actions workflow must commit/push data/used_ideas.txt.
+# ============================================================
+
+IDEA_SIMILARITY_THRESHOLD = float(
+    os.getenv("IDEA_SIMILARITY_THRESHOLD", "0.80")
+)
+IDEA_MAX_RETRIES = int(os.getenv("IDEA_MAX_RETRIES", "6"))
+
+IDEA_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at",
+    "for", "with", "from", "into", "by", "after", "before", "when", "while",
+    "who", "that", "this", "these", "those", "is", "are", "was", "were",
+    "be", "been", "being", "has", "have", "had", "do", "does", "did",
+    "their", "his", "her", "its", "they", "them", "he", "she", "it",
+    "someone", "something", "one", "two", "every", "each", "just", "very",
+}
+
+def normalize_idea_text(value: str) -> str:
+    value = str(value or "").lower()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+def idea_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in normalize_idea_text(value).split()
+        if token and token not in IDEA_STOPWORDS
+    }
+
+def idea_similarity(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+
+    a_norm = normalize_idea_text(a)
+    b_norm = normalize_idea_text(b)
+
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm == b_norm:
+        return 1.0
+
+    sequence_score = SequenceMatcher(None, a_norm, b_norm).ratio()
+
+    a_tokens = idea_tokens(a_norm)
+    b_tokens = idea_tokens(b_norm)
+
+    if not a_tokens or not b_tokens:
+        jaccard_score = 0.0
+    else:
+        jaccard_score = len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
+
+    # Stronger weight on meaningful token overlap, with wording similarity
+    # as a secondary signal.
+    return (jaccard_score * 0.80) + (sequence_score * 0.20)
+
+def load_used_ideas() -> list[str]:
+    if not USED_IDEAS_FILE.exists():
+        return []
+
+    ideas: list[str] = []
+
+    for raw_line in USED_IDEAS_FILE.read_text(
+        encoding="utf-8",
+        errors="ignore",
+    ).splitlines():
+        line = raw_line.strip()
+
+        if not line or line.startswith("#"):
+            continue
+
+        # Expected:
+        # 2026-09-13 21:30:00 UTC | idea text
+        if " | " in line:
+            _, idea = line.split(" | ", 1)
+        else:
+            # Backward-compatible with a plain one-idea-per-line file.
+            idea = line
+
+        idea = idea.strip()
         if idea:
+            ideas.append(idea)
+
+    return ideas
+
+def find_duplicate_idea(
+    candidate: str,
+    used_ideas: list[str],
+) -> tuple[bool, float, str]:
+    best_score = 0.0
+    best_match = ""
+
+    for stored_idea in used_ideas:
+        score = idea_similarity(candidate, stored_idea)
+
+        if score > best_score:
+            best_score = score
+            best_match = stored_idea
+
+        if score >= IDEA_SIMILARITY_THRESHOLD:
+            return True, score, stored_idea
+
+    return False, best_score, best_match
+
+def save_used_idea(idea: str) -> None:
+    clean_idea = re.sub(r"\s+", " ", str(idea).strip())
+
+    if not clean_idea:
+        return
+
+    IDEA_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing = load_used_ideas()
+    normalized = normalize_idea_text(clean_idea)
+
+    # Never write the exact same idea twice.
+    for stored_idea in existing:
+        if normalize_idea_text(stored_idea) == normalized:
+            return
+
+    timestamp = time.strftime(
+        "%Y-%m-%d %H:%M:%S UTC",
+        time.gmtime(),
+    )
+
+    with USED_IDEAS_FILE.open("a", encoding="utf-8") as handle:
+        handle.write(f"{timestamp} | {clean_idea}\n")
+
+    log(f"🧠 Idea saved: {USED_IDEAS_FILE}")
+
+def generate_idea() -> str:
+    used_ideas = load_used_ideas()
+
+    log(f"🧠 Used ideas loaded locally: {len(used_ideas)}")
+    log("🔒 used_ideas.txt is NOT sent to OpenRouter or Groq.")
+
+    base_prompt = f"""
+Create ONE original horror-video concept for The Fear Network.
+
+Audience:
+English-speaking viewers, especially the United States.
+
+Style:
+cinematic, disturbing, suspenseful, plausible, psychologically gripping.
+
+Rules:
+- Avoid copying known films, Reddit stories, creepypastas, or famous stories.
+- Avoid excessive gore.
+- Build a strong hook and escalating mystery.
+- Make the central horror mechanism distinctive.
+- Return JSON only.
+- Return exactly ONE idea.
+
+Topic hint:
+{TOPIC_HINT or "none"}
+
+JSON:
+{{"idea": "one-sentence original horror concept"}}
+"""
+
+    for attempt in range(1, IDEA_MAX_RETRIES + 1):
+        prompt = base_prompt
+
+        if attempt > 1:
+            prompt += """
+The previous candidate was rejected by a LOCAL duplicate checker.
+Generate a COMPLETELY DIFFERENT concept.
+Change the central horror mechanism, setting, and premise.
+Do not mention the previous idea.
+Return JSON only.
+"""
+
+        try:
+            data = ai_json(
+                "You are an expert horror concept writer for a faceless YouTube channel.",
+                prompt,
+                temperature=0.95,
+                max_tokens=500,
+            )
+
+            idea = re.sub(
+                r"\s+",
+                " ",
+                str(data.get("idea", "")).strip(),
+            )
+
+            if not idea:
+                raise RuntimeError("AI returned an empty idea.")
+
+            duplicate, score, matched = find_duplicate_idea(
+                idea,
+                used_ideas,
+            )
+
+            if duplicate:
+                log(
+                    f"♻️ Duplicate idea rejected locally "
+                    f"(attempt {attempt}/{IDEA_MAX_RETRIES}, score={score:.2f})"
+                )
+                log(f"   Match: {matched[:180]}")
+                continue
+
+            log(f"✅ Unique idea accepted (local score={score:.2f})")
             return idea
-    except Exception as error:
-        log(f"⚠️ Idea generation failed, using fallback: {error}")
-    return fallback_idea()
+
+        except Exception as error:
+            log(
+                f"⚠️ Idea generation attempt "
+                f"{attempt}/{IDEA_MAX_RETRIES} failed: {error}"
+            )
+
+    # Emergency fallback only.
+    # We still check it locally so we do not knowingly reuse an old idea.
+    log("⚠️ Uniqueness retries exhausted; trying local fallback pool.")
+
+    fallback_pool = [
+        "A night-shift security guard discovers that the cameras show him arriving in the building hours before he actually does.",
+        "A woman receives voicemail messages from her own phone recorded exactly one day in the future.",
+        "A remote forest road appears on no map, but every driver who takes it hears a child counting from the back seat.",
+        "A family moves into an old house where one locked room becomes colder every night and slowly starts answering questions.",
+        "A missing-person case is reopened after a new photograph appears online showing the missing man standing behind the detective taking the photo.",
+        "A hospital elevator stops at a floor that does not exist, and each visit removes one memory from the person inside.",
+        "A small town's emergency siren begins broadcasting tomorrow's deaths one hour before they happen.",
+        "A motel guest discovers that every room on the hallway contains a different version of his own life.",
+    ]
+
+    for fallback in fallback_pool:
+        duplicate, score, _ = find_duplicate_idea(
+            fallback,
+            used_ideas,
+        )
+
+        if not duplicate:
+            log(f"✅ Fallback idea accepted (local score={score:.2f})")
+            return fallback
+
+    # Extremely unlikely: all fallback concepts are already used.
+    # Do one final AI request rather than intentionally reusing a stored idea.
+    emergency_prompt = f"""
+Create ONE completely new horror concept for The Fear Network.
+It must use a horror mechanism that is substantially different from common
+haunted-house, ghost, possession, or future-voicemail premises.
+Topic hint: {TOPIC_HINT or "none"}
+Return JSON only:
+{{"idea": "one-sentence original horror concept"}}
+"""
+
+    data = ai_json(
+        "You are an expert horror concept writer.",
+        emergency_prompt,
+        temperature=1.0,
+        max_tokens=500,
+    )
+
+    idea = re.sub(r"\s+", " ", str(data.get("idea", "")).strip())
+
+    if not idea:
+        raise RuntimeError("Could not generate a unique horror idea.")
+
+    duplicate, score, matched = find_duplicate_idea(idea, used_ideas)
+
+    if duplicate:
+        raise RuntimeError(
+            f"Emergency idea was also too similar to a previous idea "
+            f"(score={score:.2f}): {matched[:160]}"
+        )
+
+    return idea
 
 
 def story_word_target() -> int:
@@ -917,6 +1175,10 @@ def main() -> int:
     log(f"✅ Video created: {output_path}")
 
     youtube_url = upload_to_youtube(output_path, story)
+
+    # Only mark the concept as consumed after the complete upload succeeds.
+    save_used_idea(idea)
+
     log(f"\n🎉 DONE: {youtube_url}")
     return 0
 
