@@ -755,10 +755,10 @@ def render_video(
         "-filter_complex",
         (
             f"[2:a]volume=0.075,atrim=duration={total_duration:.3f},"
-            f"asetpts=PTS-STARTPTS[m];"
+            f"asetpts=PTS-STARTPTS[music];"
             f"[1:a]acompressor=threshold=-18dB:ratio=3:attack=20:release=250[voice];"
-            f"[m][voice]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=400[ducked];"
-            f"[voice][ducked]amix=inputs=2:duration=longest:dropout_transition=2[aout]"
+            f"[music][voice]amix=inputs=2:duration=longest:"
+            f"dropout_transition=2:weights=0.15 1[aout]"
         ),
         "-map", "0:v:0",
         "-map", "[aout]",
