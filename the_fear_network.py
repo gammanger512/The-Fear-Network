@@ -773,7 +773,7 @@ def upload_to_youtube(video_path: Path, story: dict[str, Any]) -> str:
             "categoryId": "24",
         },
         "status": {
-            "privacyStatus": "public",
+            "privacyStatus": "private",
             "selfDeclaredMadeForKids": False,
         },
     }
