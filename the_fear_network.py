@@ -50,20 +50,24 @@ for folder in (OUTPUT_DIR, WORK_DIR, MEDIA_DIR, AUDIO_DIR, MUSIC_DIR):
     folder.mkdir(parents=True, exist_ok=True)
 
 # ------------------------- Settings --------------------------
-VIDEO_MODE = os.getenv("VIDEO_MODE", "long").strip().lower()  # long / short
 TOPIC_HINT = os.getenv("TOPIC_HINT", "")
 
 LONG_MINUTES = float(os.getenv("LONG_MINUTES", "10.0"))
 SHORT_MINUTES = float(os.getenv("SHORT_MINUTES", "1.5"))
 
-# We generate one visual plan item per sentence. The planner is asked to
-# keep scenes visually distinct, but the renderer can reuse assets if needed.
+# Both formats are generated on every workflow run:
+# 1) one long-form 16:9 video
+# 2) one vertical 9:16 video
+VIDEO_MODE = "long"
+VIDEO_W = 1920
+VIDEO_H = 1080
+FPS = 30
+
 MAX_SCENES_LONG = int(os.getenv("MAX_SCENES_LONG", "95"))
 MAX_SCENES_SHORT = int(os.getenv("MAX_SCENES_SHORT", "18"))
 
-VIDEO_W = 1920 if VIDEO_MODE == "long" else 1080
-VIDEO_H = 1080 if VIDEO_MODE == "long" else 1920
-FPS = 30
+LONG_MAX_RETRIES = int(os.getenv("LONG_MAX_RETRIES", "1"))
+SHORT_MAX_RETRIES = int(os.getenv("SHORT_MAX_RETRIES", "1"))
 
 # AI providers
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -1080,7 +1084,7 @@ def upload_to_youtube(video_path: Path, story: dict[str, Any]) -> str:
             "categoryId": "24",
         },
         "status": {
-            "privacyStatus": "private",
+            "privacyStatus": "public",
             "selfDeclaredMadeForKids": False,
         },
     }
@@ -1126,60 +1130,145 @@ def clean_work() -> None:
 # ============================================================
 
 
-def main() -> int:
-    log("=" * 72)
-    log(f"THE FEAR NETWORK — {VIDEO_MODE.upper()} FACTORY")
+def configure_video_mode(mode: str) -> None:
+    global VIDEO_MODE, VIDEO_W, VIDEO_H
+
+    mode = mode.strip().lower()
+
+    if mode not in {"long", "short"}:
+        raise RuntimeError("Video mode must be 'long' or 'short'.")
+
+    VIDEO_MODE = mode
+
+    if mode == "long":
+        VIDEO_W = 1920
+        VIDEO_H = 1080
+    else:
+        VIDEO_W = 1080
+        VIDEO_H = 1920
+
+    log(
+        f"\n⚙️ Configured {VIDEO_MODE.upper()} mode: "
+        f"{VIDEO_W}x{VIDEO_H}"
+    )
+
+
+def produce_one_video(mode: str, slot_label: str) -> str:
+    """
+    Generate one complete video in the requested format.
+
+    The same process is used for both formats; the mode is switched before
+    story generation so word target, scene count, media orientation, render
+    dimensions and YouTube metadata all follow the correct format.
+    """
+    configure_video_mode(mode)
+
+    log("\n" + "=" * 72)
+    log(f"🎬 PRODUCING {slot_label}: {mode.upper()}")
     log("=" * 72)
 
-    if VIDEO_MODE not in {"long", "short"}:
-        raise RuntimeError("VIDEO_MODE must be 'long' or 'short'.")
+    clean_work()
+
+    idea = generate_idea()
+    log(f"\n💡 IDEA ({mode.upper()}):\n{idea}\n")
+
+    story = generate_story(idea)
+    log(f"📝 TITLE: {story['title']}")
+    log(f"📝 NARRATION WORDS: {len(story['narration'].split())}")
+
+    narration_path = AUDIO_DIR / f"{mode}_narration.wav"
+    make_narration(story["narration"], narration_path)
+
+    narration_duration = ffprobe_duration(narration_path)
+    log(f"⏱️ Narration duration ({mode}): {narration_duration:.2f} seconds")
+
+    scenes = normalize_scene_plan(story)
+    scene_durations = estimate_scene_durations(
+        scenes,
+        narration_duration,
+    )
+
+    log(f"🎬 Scenes ({mode}): {len(scenes)}")
+
+    visual_files = prepare_visuals(scenes)
+    music = prepare_music(narration_duration)
+
+    output_name = (
+        safe_filename(story["title"], f"fear_{mode}")
+        + f"_{mode}.mp4"
+    )
+    output_path = OUTPUT_DIR / output_name
+
+    log(f"\n🎞️ Rendering {mode.upper()} video...")
+    render_video(
+        narration_path,
+        visual_files,
+        scene_durations,
+        music,
+        output_path,
+    )
+
+    log(f"✅ Video created: {output_path}")
+
+    youtube_url = upload_to_youtube(output_path, story)
+
+    # Save only after this video's YouTube upload succeeds.
+    save_used_idea(idea)
+
+    log(f"✅ {mode.upper()} published: {youtube_url}")
+    return youtube_url
+
+
+def main() -> int:
+    log("=" * 72)
+    log("THE FEAR NETWORK — DUAL-FORMAT FACTORY")
+    log("Every run produces:")
+    log("  1) LONG 16:9")
+    log("  2) SHORT 9:16")
+    log("=" * 72)
 
     required = {
         "PEXELS_API_KEY": PEXELS_API_KEY,
         "PIXABAY_API_KEY": PIXABAY_API_KEY,
         "YOUTUBE_TOKEN_JSON": YOUTUBE_TOKEN_JSON,
     }
-    missing = [name for name, value in required.items() if not value]
+
+    missing = [
+        name
+        for name, value in required.items()
+        if not value
+    ]
+
     if missing:
-        raise RuntimeError("Missing secrets: " + ", ".join(missing))
+        raise RuntimeError(
+            "Missing secrets: " + ", ".join(missing)
+        )
 
     if not VOICE_WAV.exists():
-        raise FileNotFoundError(f"Missing voice reference: {VOICE_WAV}")
+        raise FileNotFoundError(
+            f"Missing voice reference: {VOICE_WAV}"
+        )
 
-    clean_work()
+    IDEA_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
-    idea = generate_idea()
-    log(f"\n💡 IDEA:\n{idea}\n")
+    # First: 16:9 long-form.
+    long_url = produce_one_video(
+        "long",
+        "VIDEO 1 / 2 — LONG 16:9",
+    )
 
-    story = generate_story(idea)
-    log(f"📝 TITLE: {story['title']}")
-    log(f"📝 NARRATION WORDS: {len(story['narration'].split())}")
+    # Second: 9:16 vertical.
+    short_url = produce_one_video(
+        "short",
+        "VIDEO 2 / 2 — SHORT 9:16",
+    )
 
-    narration_path = AUDIO_DIR / "narration.wav"
-    make_narration(story["narration"], narration_path)
-    narration_duration = ffprobe_duration(narration_path)
-    log(f"⏱️ Narration duration: {narration_duration:.2f} seconds")
+    log("\n" + "=" * 72)
+    log("🎉 BOTH VIDEOS PUBLISHED SUCCESSFULLY")
+    log(f"16:9: {long_url}")
+    log(f"9:16: {short_url}")
+    log("=" * 72)
 
-    scenes = normalize_scene_plan(story)
-    scene_durations = estimate_scene_durations(scenes, narration_duration)
-    log(f"🎬 Scenes: {len(scenes)}")
-
-    visual_files = prepare_visuals(scenes)
-    music = prepare_music(narration_duration)
-
-    output_name = safe_filename(story["title"], "fear_video") + ".mp4"
-    output_path = OUTPUT_DIR / output_name
-
-    log("\n🎞️ Rendering final video...")
-    render_video(narration_path, visual_files, scene_durations, music, output_path)
-    log(f"✅ Video created: {output_path}")
-
-    youtube_url = upload_to_youtube(output_path, story)
-
-    # Only mark the concept as consumed after the complete upload succeeds.
-    save_used_idea(idea)
-
-    log(f"\n🎉 DONE: {youtube_url}")
     return 0
 
 
