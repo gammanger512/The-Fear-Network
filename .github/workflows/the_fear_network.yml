@@ -2,19 +2,15 @@ name: The Fear Network
 
 on:
   workflow_dispatch:
-    inputs:
-      video_mode:
-        description: "Video mode"
-        required: true
-        default: "long"
-        type: choice
-        options:
-          - long
-          - short
 
   schedule:
+    # 23:00 Egypt (UTC+3)
     - cron: "0 20 * * *"
+
+    # 02:00 Egypt (UTC+3)
     - cron: "0 23 * * *"
+
+    # 05:00 Egypt (UTC+3)
     - cron: "0 2 * * *"
 
 permissions:
@@ -35,15 +31,24 @@ jobs:
       COQUI_TOS_AGREED: "1"
 
     steps:
+      # ========================================================
+      # CHECKOUT
+      # ========================================================
       - name: Checkout
         uses: actions/checkout@v5
 
+      # ========================================================
+      # PYTHON
+      # ========================================================
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
 
+      # ========================================================
+      # XTTS CACHE
+      # ========================================================
       - name: Cache XTTS model
         uses: actions/cache@v4
         with:
@@ -52,46 +57,56 @@ jobs:
           restore-keys: |
             xtts-v2-ubuntu-py311-
 
+      # ========================================================
+      # SYSTEM DEPENDENCIES
+      # ========================================================
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y ffmpeg libsndfile1
 
+      # ========================================================
+      # PYTHON DEPENDENCIES
+      # ========================================================
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install             --index-url https://download.pytorch.org/whl/cpu             torch==2.9.1             torchaudio==2.9.1
+
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.9.1 \
+            torchaudio==2.9.1
+
           python -m pip install -r requirements.txt --no-deps
-          python -m pip install             coqui-tts==0.27.5             torchcodec==0.9.0             transformers==4.57.6
-          python -m pip install             google-api-python-client             google-auth             google-auth-oauthlib             requests             groq
 
-      - name: Select scheduled video mode
-        id: mode
-        shell: bash
-        run: |
-          if [ -n "${{ inputs.video_mode }}" ]; then
-            echo "VIDEO_MODE=${{ inputs.video_mode }}" >> "$GITHUB_ENV"
-            echo "Manual mode selected: ${{ inputs.video_mode }}"
-            exit 0
-          fi
+          python -m pip install \
+            coqui-tts==0.27.5 \
+            torchcodec==0.9.0 \
+            transformers==4.57.6
 
-          hour="$(date -u +%H)"
+          python -m pip install \
+            google-api-python-client \
+            google-auth \
+            google-auth-oauthlib \
+            requests \
+            groq
 
-          if [ "$hour" = "20" ] || [ "$hour" = "23" ]; then
-            echo "VIDEO_MODE=long" >> "$GITHUB_ENV"
-            echo "Scheduled mode: LONG"
-          else
-            echo "VIDEO_MODE=short" >> "$GITHUB_ENV"
-            echo "Scheduled mode: SHORT"
-          fi
-
+      # ========================================================
+      # VOICE
+      # ========================================================
       - name: Verify voice reference
         run: |
           test -f voice.wav
+
           echo "Voice reference found:"
           ls -lh voice.wav
+
           echo "Voice duration:"
-          ffprobe             -v error             -show_entries format=duration             -of default=nw=1:nk=1             voice.wav
+          ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=nw=1:nk=1 \
+            voice.wav
 
       # ========================================================
       # IDEA MEMORY
@@ -99,13 +114,20 @@ jobs:
       - name: Prepare idea memory
         run: |
           mkdir -p data
+
           if [ ! -f data/used_ideas.txt ]; then
-            printf '%s\n'               '# The Fear Network — consumed story ideas'               '# One line per successful YouTube upload.'               > data/used_ideas.txt
+            printf '%s\n' \
+              '# The Fear Network — consumed story ideas' \
+              '# One line per successful YouTube upload.' \
+              > data/used_ideas.txt
           fi
 
           echo "Idea memory:"
           wc -l data/used_ideas.txt
 
+      # ========================================================
+      # RUN THE FEAR NETWORK
+      # ========================================================
       - name: Run The Fear Network
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -116,7 +138,8 @@ jobs:
         run: |
           echo "=============================================="
           echo "THE FEAR NETWORK"
-          echo "VIDEO_MODE=$VIDEO_MODE"
+          echo "THIS RUN WILL GENERATE BOTH FORMATS"
+          echo "16:9 + 9:16"
           echo "=============================================="
 
           python the_fear_network.py
