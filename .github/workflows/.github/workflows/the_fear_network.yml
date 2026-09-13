@@ -65,7 +65,7 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.9.1 torchaudio==2.9.1
           python -m pip install -r requirements.txt --no-deps
           python -m pip install coqui-tts==0.27.5
-          python -m pip install torchcodec==0.16.0 transformers==4.57.6 google-api-python-client google-auth requests
+          python -m pip install torchcodec==0.16.0 transformers==4.57.6 google-api-python-client google-auth requests groq
 
       - name: Select scheduled video mode
         id: mode
@@ -91,7 +91,7 @@ jobs:
       - name: Run The Fear Network
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROK_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
