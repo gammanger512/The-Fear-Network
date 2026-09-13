@@ -679,21 +679,21 @@ def render_video(
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
                 "-pix_fmt", "yuv420p", str(segment),
             ]
-
         run_command(command)
         concat_inputs.append(segment)
 
     concat_list = WORK_DIR / "concat.txt"
     with concat_list.open("w", encoding="utf-8") as handle:
         for path in concat_inputs:
-            handle.write(f"file '{path.as_posix().replace("'", "'\\''")}'\n")
+            safe_path = path.as_posix().replace("'", "'\\''")
+            handle.write(f"file '{safe_path}'\n")
 
     visual_track = WORK_DIR / "visual_track.mp4"
     run_command([
         ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
         "-an", "-c", "copy", str(visual_track)
     ])
-
+    
     # Match final visuals to narration duration exactly, add music under it.
     narration_duration = ffprobe_duration(narration)
     total_duration = max(narration_duration, 1.0)
